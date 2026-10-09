@@ -255,7 +255,7 @@
                     <div class="card-header">
                         <i class="fas fa-shield-lock"></i>
                         <h3>CipherVault</h3>
-                        <p class="mb-0 mt-2">Military-grade encryption – unbreakable without the key</p>
+                        <p class="mb-0 mt-2">AES-256-GCM encryption with PBKDF2 key derivation</p>
                     </div>
                     
                     <div class="card-body p-0">
@@ -441,17 +441,8 @@
             } catch { return null; }
         }
 
-        // ENCRYPT: 4 layers
-        function encryptData(text, key) {
-            if (!key) throw new Error("Key cannot be empty!");
-            let step1 = xor(text, key);
-            let step2 = vigenere(step1, key);
-            let step3 = caesar(step2, key.length);
-            return b64e(step3);
-        }
-
-        // DECRYPT: 4 layers reversed
-        function decryptData(encrypted, key) {
+        // Legacy format (XOR + Vigenère + Caesar + Base64), kept only so old ciphertexts can still be decrypted
+        function legacyDecrypt(encrypted, key) {
             if (!key) throw new Error("Key cannot be empty!");
             let step1 = b64d(encrypted);
             if (!step1) throw new Error("Invalid encrypted data!");
@@ -460,17 +451,85 @@
             return xor(step3, key);
         }
 
+        // AES-256-GCM with a PBKDF2-SHA256 derived key.
+        // Output: "CV1:" + base64(salt[16] | iv[12] | ciphertext+tag)
+        const MIN_KEY_LENGTH = 6;
+        const FORMAT_PREFIX = 'CV1:';
+        const PBKDF2_ITERATIONS = 600000;
+        const SALT_BYTES = 16;
+        const IV_BYTES = 12;
+
+        function bytesToBase64(bytes) {
+            let bin = '';
+            for (let i = 0; i < bytes.length; i += 0x8000) {
+                bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+            }
+            return btoa(bin);
+        }
+
+        function base64ToBytes(str) {
+            const bin = atob(str);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            return bytes;
+        }
+
+        async function deriveKey(password, salt) {
+            const baseKey = await crypto.subtle.importKey(
+                'raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
+            return crypto.subtle.deriveKey(
+                { name: 'PBKDF2', salt, iterations: PBKDF2_ITERATIONS, hash: 'SHA-256' },
+                baseKey, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+        }
+
+        async function encryptData(text, password) {
+            if (!password) throw new Error("Key cannot be empty!");
+            const salt = crypto.getRandomValues(new Uint8Array(SALT_BYTES));
+            const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
+            const key = await deriveKey(password, salt);
+            const ciphertext = new Uint8Array(await crypto.subtle.encrypt(
+                { name: 'AES-GCM', iv }, key, new TextEncoder().encode(text)));
+            const out = new Uint8Array(SALT_BYTES + IV_BYTES + ciphertext.length);
+            out.set(salt, 0);
+            out.set(iv, SALT_BYTES);
+            out.set(ciphertext, SALT_BYTES + IV_BYTES);
+            return FORMAT_PREFIX + bytesToBase64(out);
+        }
+
+        async function decryptData(encrypted, password) {
+            if (!password) throw new Error("Key cannot be empty!");
+            if (!encrypted.startsWith(FORMAT_PREFIX)) return legacyDecrypt(encrypted, password);
+            let data;
+            try {
+                data = base64ToBytes(encrypted.slice(FORMAT_PREFIX.length));
+            } catch {
+                throw new Error("Invalid encrypted data!");
+            }
+            if (data.length < SALT_BYTES + IV_BYTES + 16) throw new Error("Invalid encrypted data!");
+            const salt = data.subarray(0, SALT_BYTES);
+            const iv = data.subarray(SALT_BYTES, SALT_BYTES + IV_BYTES);
+            const key = await deriveKey(password, salt);
+            try {
+                const plain = await crypto.subtle.decrypt(
+                    { name: 'AES-GCM', iv }, key, data.subarray(SALT_BYTES + IV_BYTES));
+                return new TextDecoder().decode(plain);
+            } catch {
+                throw new Error("Wrong key or corrupted data!");
+            }
+        }
+
         // Handle encryption
-        document.getElementById('btn-encrypt').addEventListener('click', () => {
+        document.getElementById('btn-encrypt').addEventListener('click', async () => {
             const input = document.getElementById('encrypt-input').value;
             const key = document.getElementById('encrypt-key').value;
             const resultBox = document.getElementById('encrypt-result');
 
             if (!input.trim()) return resultBox.innerHTML = '<em class="text-danger">Please enter data to encrypt!</em>';
-            if (!key || key.length < 4) return resultBox.innerHTML = '<em class="text-danger">Key must be at least 4 characters!</em>';
+            if (!key || key.length < MIN_KEY_LENGTH) return resultBox.innerHTML = `<em class="text-danger">Key must be at least ${MIN_KEY_LENGTH} characters!</em>`;
 
             try {
-                const encrypted = encryptData(input, key);
+                resultBox.innerHTML = '<em>Encrypting...</em>';
+                const encrypted = await encryptData(input, key);
                 resultBox.textContent = encrypted;
             } catch (e) {
                 resultBox.innerHTML = `<em class="text-danger">Error: ${e.message}</em>`;
@@ -478,16 +537,17 @@
         });
 
         // Handle decryption
-        document.getElementById('btn-decrypt').addEventListener('click', () => {
+        document.getElementById('btn-decrypt').addEventListener('click', async () => {
             const input = document.getElementById('decrypt-input').value.trim();
             const key = document.getElementById('decrypt-key').value;
             const resultBox = document.getElementById('decrypt-result');
 
             if (!input) return resultBox.innerHTML = '<em class="text-danger">Please paste encrypted data!</em>';
-            if (!key || key.length < 4) return resultBox.innerHTML = '<em class="text-danger">Key must be at least 4 characters!</em>';
+            if (!key) return resultBox.innerHTML = '<em class="text-danger">Please enter the key!</em>';
 
             try {
-                const decrypted = decryptData(input, key);
+                resultBox.innerHTML = '<em>Decrypting...</em>';
+                const decrypted = await decryptData(input, key);
                 resultBox.textContent = decrypted;
             } catch (e) {
                 resultBox.innerHTML = `<em class="text-danger">Decryption failed: ${e.message}</em>`;
